@@ -1,5 +1,9 @@
 #!/bin/bash
 
+set -e
+
+ORIGINAL_ARGS=("$@")
+
 export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 export NANOCHAT_DATASET_BASE_URL="${NANOCHAT_DATASET_BASE_URL:-https://huggingface.co/datasets/jrast/clean-text-v1/resolve/main}"
@@ -8,6 +12,9 @@ export NANOCHAT_DATASET_DIR_NAME="${NANOCHAT_DATASET_DIR_NAME:-full_5m_may_2026}
 NPROC_PER_NODE=8
 CORE_METRIC_EVERY=200
 SAVE_EVERY=200
+USE_TMUX=1
+AUTO_SHUTDOWN=1
+TMUX_SESSION_NAME="${TMUX_SESSION_NAME:-speedrun_full_5m_may_2026}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -39,8 +46,24 @@ while [ $# -gt 0 ]; do
             SAVE_EVERY="${1#*=}"
             shift
             ;;
+        --no-tmux)
+            USE_TMUX=0
+            shift
+            ;;
+        --no-shutdown)
+            AUTO_SHUTDOWN=0
+            shift
+            ;;
+        --tmux-session)
+            TMUX_SESSION_NAME="$2"
+            shift 2
+            ;;
+        --tmux-session=*)
+            TMUX_SESSION_NAME="${1#*=}"
+            shift
+            ;;
         *)
-            echo "Usage: $0 [--gpus 1|8] [--single-gpu] [--core-every N] [--save-every N]" >&2
+            echo "Usage: $0 [--gpus 1|8] [--single-gpu] [--core-every N] [--save-every N] [--no-tmux] [--no-shutdown] [--tmux-session NAME]" >&2
             exit 1
             ;;
     esac
@@ -60,6 +83,39 @@ if ! [[ "$SAVE_EVERY" =~ ^-?[0-9]+$ ]]; then
     echo "SAVE_EVERY must be an integer" >&2
     exit 1
 fi
+
+if [ -z "$TMUX" ] && [ "${NANOCHAT_IN_TMUX:-0}" != "1" ] && [ "$USE_TMUX" = "1" ]; then
+    command -v tmux &> /dev/null || (apt-get update && apt-get install -y tmux)
+    if tmux has-session -t "$TMUX_SESSION_NAME" 2>/dev/null; then
+        echo "tmux session already exists: $TMUX_SESSION_NAME" >&2
+        echo "Attach with: tmux attach -t $TMUX_SESSION_NAME" >&2
+        exit 1
+    fi
+    TMUX_CMD="cd $(printf "%q" "$PWD") && NANOCHAT_IN_TMUX=1 bash $(printf "%q" "$0")"
+    for arg in "${ORIGINAL_ARGS[@]}"; do
+        TMUX_CMD="$TMUX_CMD $(printf "%q" "$arg")"
+    done
+    tmux new-session -d -s "$TMUX_SESSION_NAME" "$TMUX_CMD"
+    echo "Started tmux session: $TMUX_SESSION_NAME"
+    echo "Attach with: tmux attach -t $TMUX_SESSION_NAME"
+    exit 0
+fi
+
+shutdown_node() {
+    if [ "$AUTO_SHUTDOWN" != "1" ]; then
+        return
+    fi
+    sync
+    if command -v runpodctl &> /dev/null; then
+        runpodctl stop pod
+    elif command -v shutdown &> /dev/null; then
+        shutdown -h now
+    elif command -v poweroff &> /dev/null; then
+        poweroff
+    else
+        echo "No shutdown command found" >&2
+    fi
+}
 
 apt-get update
 apt-get install -y python3-dev build-essential rsync vim tmux
@@ -103,4 +159,4 @@ curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-publ
 
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.chat_sft -- --device-batch-size=16 --run=$WANDB_RUN
 
-python -m scripts.chat_web
+shutdown_node
