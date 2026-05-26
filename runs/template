@@ -1,0 +1,196 @@
+#!/bin/bash
+
+set -e
+
+RUNPOD_API_KEY="${RUNPOD_API_KEY:-}"
+WANDB_API_KEY="${WANDB_API_KEY:-}"
+
+RUN_NAME="full_5m_may_2026"
+DATASET="jrast/clean-text-v1"
+GPU_COUNT=8
+
+GPU_ID="NVIDIA H100 SXM"
+IMAGE="runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404"
+REPO_URL="https://github.com/jacobrast/nanochat.git"
+BRANCH="master"
+POD_NAME="nanochat-full-5m"
+CONTAINER_DISK_GB=200
+VOLUME_GB=500
+STOP_AFTER="8h"
+DRY_RUN=0
+
+usage() {
+    echo "Usage: $0 [--run-name NAME] [--dataset OWNER/NAME|URL] [--gpu-count N] [--gpu-id GPU] [--branch BRANCH] [--dry-run]" >&2
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --run-name)
+            RUN_NAME="$2"
+            shift 2
+            ;;
+        --run-name=*)
+            RUN_NAME="${1#*=}"
+            shift
+            ;;
+        --dataset)
+            DATASET="$2"
+            shift 2
+            ;;
+        --dataset=*)
+            DATASET="${1#*=}"
+            shift
+            ;;
+        --gpu-count)
+            GPU_COUNT="$2"
+            shift 2
+            ;;
+        --gpu-count=*)
+            GPU_COUNT="${1#*=}"
+            shift
+            ;;
+        --gpu-id)
+            GPU_ID="$2"
+            shift 2
+            ;;
+        --gpu-id=*)
+            GPU_ID="${1#*=}"
+            shift
+            ;;
+        --branch)
+            BRANCH="$2"
+            shift 2
+            ;;
+        --branch=*)
+            BRANCH="${1#*=}"
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        *)
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+if [ -z "$RUNPOD_API_KEY" ]; then
+    echo "Set RUNPOD_API_KEY at the top of this script." >&2
+    exit 1
+fi
+
+if [ -z "$WANDB_API_KEY" ]; then
+    echo "Set WANDB_API_KEY at the top of this script." >&2
+    exit 1
+fi
+
+if ! command -v python3 &> /dev/null; then
+    echo "python3 is required to build the env JSON." >&2
+    exit 1
+fi
+
+if ! command -v base64 &> /dev/null; then
+    echo "base64 is required to package the startup command." >&2
+    exit 1
+fi
+
+case "$DATASET" in
+    http://*|https://*)
+        DATASET_BASE_URL="${DATASET%/}"
+        if [[ "$DATASET_BASE_URL" != */resolve/* ]]; then
+            DATASET_BASE_URL="$DATASET_BASE_URL/resolve/main"
+        fi
+        ;;
+    *)
+        DATASET_BASE_URL="https://huggingface.co/datasets/$DATASET/resolve/main"
+        ;;
+esac
+
+DATASET_DIR_NAME="$RUN_NAME"
+
+ENV_JSON=$(python3 - "$WANDB_API_KEY" "$RUN_NAME" "$DATASET_BASE_URL" "$DATASET_DIR_NAME" <<'PY'
+import json
+import sys
+
+wandb_api_key, run_name, dataset_base_url, dataset_dir_name = sys.argv[1:]
+print(json.dumps({
+    "WANDB_API_KEY": wandb_api_key,
+    "WANDB_RUN": run_name,
+    "NANOCHAT_DATASET_BASE_URL": dataset_base_url,
+    "NANOCHAT_DATASET_MAX_SHARD": "auto",
+    "NANOCHAT_DATASET_DIR_NAME": dataset_dir_name,
+}))
+PY
+)
+
+MASKED_ENV_JSON=$(python3 - "$RUN_NAME" "$DATASET_BASE_URL" "$DATASET_DIR_NAME" <<'PY'
+import json
+import sys
+
+run_name, dataset_base_url, dataset_dir_name = sys.argv[1:]
+print(json.dumps({
+    "WANDB_API_KEY": "***",
+    "WANDB_RUN": run_name,
+    "NANOCHAT_DATASET_BASE_URL": dataset_base_url,
+    "NANOCHAT_DATASET_MAX_SHARD": "auto",
+    "NANOCHAT_DATASET_DIR_NAME": dataset_dir_name,
+}))
+PY
+)
+
+quote() {
+    printf "%q" "$1"
+}
+
+REMOTE_CMD="set -e; cd /workspace; if [ -d nanochat/.git ]; then cd nanochat; git fetch origin; git checkout $(quote "$BRANCH"); git pull --ff-only origin $(quote "$BRANCH"); else git clone --branch $(quote "$BRANCH") $(quote "$REPO_URL") nanochat; cd nanochat; fi; bash runs/speedrun_template.sh --no-tmux --gpus $(quote "$GPU_COUNT")"
+REMOTE_CMD_B64=$(printf "%s" "$REMOTE_CMD" | base64 | tr -d '\n')
+DOCKER_ARGS="bash -lc 'echo $REMOTE_CMD_B64 | base64 -d | bash'"
+
+CMD=(
+    runpodctl pod create
+    --name "$POD_NAME"
+    --image "$IMAGE"
+    --gpu-id "$GPU_ID"
+    --gpu-count "$GPU_COUNT"
+    --container-disk-in-gb "$CONTAINER_DISK_GB"
+    --volume-in-gb "$VOLUME_GB"
+    --env "$ENV_JSON"
+    --docker-args "$DOCKER_ARGS"
+    --stop-after "$STOP_AFTER"
+)
+
+DISPLAY_CMD=(
+    runpodctl pod create
+    --name "$POD_NAME"
+    --image "$IMAGE"
+    --gpu-id "$GPU_ID"
+    --gpu-count "$GPU_COUNT"
+    --container-disk-in-gb "$CONTAINER_DISK_GB"
+    --volume-in-gb "$VOLUME_GB"
+    --env "$MASKED_ENV_JSON"
+    --docker-args "$DOCKER_ARGS"
+    --stop-after "$STOP_AFTER"
+)
+
+printf "Run name: %s\n" "$RUN_NAME"
+printf "Dataset URL: %s\n" "$DATASET_BASE_URL"
+printf "GPU count: %s\n" "$GPU_COUNT"
+printf "Remote command:\n%s\n" "$REMOTE_CMD"
+printf "Command:\n"
+printf "  %q" "${DISPLAY_CMD[@]}"
+printf "\n"
+
+if [ "$DRY_RUN" = "1" ]; then
+    exit 0
+fi
+
+if ! command -v runpodctl &> /dev/null; then
+    echo "runpodctl is not installed. Install it first: https://docs.runpod.io/runpodctl/overview" >&2
+    exit 1
+fi
+
+runpodctl config --apiKey "$RUNPOD_API_KEY"
+
+"${CMD[@]}"

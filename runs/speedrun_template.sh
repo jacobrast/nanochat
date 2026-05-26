@@ -14,7 +14,7 @@ CORE_METRIC_EVERY=200
 SAVE_EVERY=200
 USE_TMUX=1
 AUTO_SHUTDOWN=1
-TMUX_SESSION_NAME="${TMUX_SESSION_NAME:-speedrun_full_5m_may_2026}"
+TMUX_SESSION_NAME="${TMUX_SESSION_NAME:-speedrun_template}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
