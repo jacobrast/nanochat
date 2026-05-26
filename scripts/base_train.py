@@ -14,6 +14,7 @@ python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 -
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import gc
+import glob
 import json
 import time
 import math
@@ -75,6 +76,7 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--wandb-save-checkpoints", action="store_true", help="upload saved checkpoints to wandb as artifacts")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -160,6 +162,23 @@ if resuming:
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
+
+def upload_checkpoint_to_wandb(step):
+    if use_dummy_wandb or not args.wandb_save_checkpoints or not master_process:
+        return
+    checkpoint_files = [
+        os.path.join(checkpoint_dir, f"model_{step:06d}.pt"),
+        os.path.join(checkpoint_dir, f"meta_{step:06d}.json"),
+    ]
+    checkpoint_files.extend(sorted(glob.glob(os.path.join(checkpoint_dir, f"optim_{step:06d}_rank*.pt"))))
+    artifact = wandb.Artifact(
+        name=f"{args.run}-{output_dirname}-step-{step:06d}",
+        type="model-checkpoint",
+        metadata={"step": step, "model_tag": output_dirname},
+    )
+    for path in checkpoint_files:
+        artifact.add_file(path, name=os.path.basename(path))
+    wandb_run.log_artifact(artifact, aliases=[f"step-{step:06d}", "latest"])
 
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)
@@ -497,6 +516,9 @@ while True:
             },
             rank=ddp_rank,
         )
+        if is_ddp_initialized():
+            dist.barrier()
+        upload_checkpoint_to_wandb(step)
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
     if last_step:

@@ -8,26 +8,67 @@ For details of how the dataset was prepared, see `repackage_data_reference.py`.
 """
 
 import os
+import re
 import argparse
 import time
 import requests
 import pyarrow.parquet as pq
 from multiprocessing import Pool
 from functools import partial
+from urllib.parse import urlparse
 
 from nanochat.common import get_base_dir
 
 # -----------------------------------------------------------------------------
 # The specifics of the current pretraining dataset
 
-def _get_env_int(name, default):
+def _get_env_max_shard(name, default):
     value = os.environ.get(name)
     if value is None:
         return default
+    if value.lower() == "auto":
+        return "auto"
     try:
         return int(value)
     except ValueError:
-        raise ValueError(f"{name} must be an integer, got {value!r}") from None
+        raise ValueError(f"{name} must be an integer or 'auto', got {value!r}") from None
+
+def _infer_hf_dataset_repo_id(base_url):
+    repo_id = os.environ.get("NANOCHAT_DATASET_REPO_ID")
+    if repo_id:
+        return repo_id
+    parsed = urlparse(base_url)
+    if parsed.netloc not in ("huggingface.co", "www.huggingface.co"):
+        return None
+    parts = [p for p in parsed.path.split("/") if p]
+    if len(parts) >= 3 and parts[0] == "datasets":
+        return f"{parts[1]}/{parts[2]}"
+    return None
+
+def _detect_max_shard(base_url):
+    repo_id = _infer_hf_dataset_repo_id(base_url)
+    if repo_id is None:
+        raise ValueError("Could not infer Hugging Face dataset repo id from base URL; set NANOCHAT_DATASET_REPO_ID or pass an integer --max-shard")
+    try:
+        from huggingface_hub import HfApi
+    except ImportError:
+        raise ImportError("huggingface_hub is required for --max-shard=auto") from None
+    files = HfApi().list_repo_files(repo_id=repo_id, repo_type="dataset")
+    shards = []
+    for name in files:
+        match = re.fullmatch(r"shard_(\d{5})\.parquet", name)
+        if match:
+            shards.append(int(match.group(1)))
+    if not shards:
+        raise ValueError(f"No shard_XXXXX.parquet files found in Hugging Face dataset {repo_id}")
+    max_shard = max(shards)
+    print(f"Detected max shard: {max_shard} ({len(shards)} shards, last shard: {index_to_filename(max_shard)})")
+    return max_shard
+
+def _resolve_max_shard(max_shard, base_url):
+    if isinstance(max_shard, str) and max_shard.lower() == "auto":
+        return _detect_max_shard(base_url)
+    return int(max_shard)
 
 # The URL on the internet where the data is hosted and downloaded from on demand
 DEFAULT_BASE_URL = "https://huggingface.co/datasets/jrast/clean-text-v1/resolve/main"
@@ -35,7 +76,7 @@ DEFAULT_MAX_SHARD = 143
 DEFAULT_DATA_DIR_NAME = "base_data_climbmix"
 
 BASE_URL = os.environ.get("NANOCHAT_DATASET_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
-MAX_SHARD = _get_env_int("NANOCHAT_DATASET_MAX_SHARD", DEFAULT_MAX_SHARD)
+MAX_SHARD = _get_env_max_shard("NANOCHAT_DATASET_MAX_SHARD", DEFAULT_MAX_SHARD)
 index_to_filename = lambda index: f"shard_{index:05d}.parquet" # format of the filenames
 base_dir = get_base_dir()
 DATA_DIR_NAME = os.environ.get("NANOCHAT_DATASET_DIR_NAME", DEFAULT_DATA_DIR_NAME)
@@ -155,12 +196,13 @@ if __name__ == "__main__":
     parser.add_argument("-n", "--num-files", type=int, default=-1, help="Number of train shards to download (default: -1), -1 = disable")
     parser.add_argument("-w", "--num-workers", type=int, default=4, help="Number of parallel download workers (default: 4)")
     parser.add_argument("--base-url", type=str, default=BASE_URL, help="Base URL that contains parquet shards")
-    parser.add_argument("--max-shard", type=int, default=MAX_SHARD, help="Validation shard index, also used as the max train shard count")
+    parser.add_argument("--max-shard", type=str, default=MAX_SHARD, help="Validation shard index, or 'auto' to detect from Hugging Face")
     parser.add_argument("--data-dir", type=str, default=DATA_DIR, help="Directory where parquet shards are stored")
     args = parser.parse_args()
 
     # Prepare the output directory
     args.base_url = args.base_url.rstrip("/")
+    args.max_shard = _resolve_max_shard(args.max_shard, args.base_url)
     os.makedirs(args.data_dir, exist_ok=True)
 
     # The way this works is that the user specifies the number of train shards to download via the -n flag.
