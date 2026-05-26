@@ -13,18 +13,33 @@ import time
 import requests
 import pyarrow.parquet as pq
 from multiprocessing import Pool
+from functools import partial
 
 from nanochat.common import get_base_dir
 
 # -----------------------------------------------------------------------------
 # The specifics of the current pretraining dataset
 
+def _get_env_int(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer, got {value!r}") from None
+
 # The URL on the internet where the data is hosted and downloaded from on demand
-BASE_URL = "https://huggingface.co/datasets/jrast/clean-text-v1/resolve/main"
-MAX_SHARD = 143 # the last datashard is shard_06542.parquet
+DEFAULT_BASE_URL = "https://huggingface.co/datasets/jrast/clean-text-v1/resolve/main"
+DEFAULT_MAX_SHARD = 143
+DEFAULT_DATA_DIR_NAME = "base_data_climbmix"
+
+BASE_URL = os.environ.get("NANOCHAT_DATASET_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+MAX_SHARD = _get_env_int("NANOCHAT_DATASET_MAX_SHARD", DEFAULT_MAX_SHARD)
 index_to_filename = lambda index: f"shard_{index:05d}.parquet" # format of the filenames
 base_dir = get_base_dir()
-DATA_DIR = os.path.join(base_dir, "base_data_climbmix")
+DATA_DIR_NAME = os.environ.get("NANOCHAT_DATASET_DIR_NAME", DEFAULT_DATA_DIR_NAME)
+DATA_DIR = os.environ.get("NANOCHAT_DATASET_DIR", os.path.join(base_dir, DATA_DIR_NAME))
 
 # -----------------------------------------------------------------------------
 # These functions are useful utilities to other modules, can/should be imported
@@ -81,18 +96,20 @@ def parquets_iter_batched(split, start=0, step=1):
             yield texts
 
 # -----------------------------------------------------------------------------
-def download_single_file(index):
+def download_single_file(index, base_url=None, data_dir=None):
     """ Downloads a single file index, with some backoff """
+    base_url = BASE_URL if base_url is None else base_url.rstrip("/")
+    data_dir = DATA_DIR if data_dir is None else data_dir
 
     # Construct the local filepath for this file and skip if it already exists
     filename = index_to_filename(index)
-    filepath = os.path.join(DATA_DIR, filename)
+    filepath = os.path.join(data_dir, filename)
     if os.path.exists(filepath):
         print(f"Skipping {filepath} (already exists)")
         return True
 
     # Construct the remote URL for this file
-    url = f"{BASE_URL}/{filename}"
+    url = f"{base_url}/{filename}"
     print(f"Downloading {filename}...")
 
     # Download with retries
@@ -137,24 +154,31 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download pretraining dataset shards")
     parser.add_argument("-n", "--num-files", type=int, default=-1, help="Number of train shards to download (default: -1), -1 = disable")
     parser.add_argument("-w", "--num-workers", type=int, default=4, help="Number of parallel download workers (default: 4)")
+    parser.add_argument("--base-url", type=str, default=BASE_URL, help="Base URL that contains parquet shards")
+    parser.add_argument("--max-shard", type=int, default=MAX_SHARD, help="Validation shard index, also used as the max train shard count")
+    parser.add_argument("--data-dir", type=str, default=DATA_DIR, help="Directory where parquet shards are stored")
     args = parser.parse_args()
 
     # Prepare the output directory
-    os.makedirs(DATA_DIR, exist_ok=True)
+    args.base_url = args.base_url.rstrip("/")
+    os.makedirs(args.data_dir, exist_ok=True)
 
     # The way this works is that the user specifies the number of train shards to download via the -n flag.
     # In addition to that, the validation shard is *always* downloaded and is pinned to be the last shard.
-    num_train_shards = MAX_SHARD if args.num_files == -1 else min(args.num_files, MAX_SHARD)
+    num_train_shards = args.max_shard if args.num_files == -1 else min(args.num_files, args.max_shard)
     ids_to_download = list(range(num_train_shards))
-    ids_to_download.append(MAX_SHARD) # always download the validation shard
+    ids_to_download.append(args.max_shard) # always download the validation shard
 
     # Download the shards
     print(f"Downloading {len(ids_to_download)} shards using {args.num_workers} workers...")
-    print(f"Target directory: {DATA_DIR}")
+    print(f"Base URL: {args.base_url}")
+    print(f"Max shard: {args.max_shard}")
+    print(f"Target directory: {args.data_dir}")
     print()
+    download_file = partial(download_single_file, base_url=args.base_url, data_dir=args.data_dir)
     with Pool(processes=args.num_workers) as pool:
-        results = pool.map(download_single_file, ids_to_download)
+        results = pool.map(download_file, ids_to_download)
 
     # Report results
     successful = sum(1 for success in results if success)
-    print(f"Done! Downloaded: {successful}/{len(ids_to_download)} shards to {DATA_DIR}")
+    print(f"Done! Downloaded: {successful}/{len(ids_to_download)} shards to {args.data_dir}")
