@@ -2,7 +2,7 @@
 
 export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
-export NANOCHAT_DATASET_BASE_URL="${NANOCHAT_DATASET_BASE_URL:-https://huggingface.co/datasets/jrast/full_5m_may_2026/resolve/main}"
+export NANOCHAT_DATASET_BASE_URL="${NANOCHAT_DATASET_BASE_URL:-https://huggingface.co/datasets/jrast/clean-text-v1/resolve/main}"
 export NANOCHAT_DATASET_MAX_SHARD="${NANOCHAT_DATASET_MAX_SHARD:-auto}"
 export NANOCHAT_DATASET_DIR_NAME="${NANOCHAT_DATASET_DIR_NAME:-full_5m_may_2026}"
 NPROC_PER_NODE=8
@@ -75,7 +75,9 @@ ln -sfn /workspace/.cache /root/.cache
 
 mkdir -p $NANOCHAT_BASE_DIR
 
+export PATH="$HOME/.local/bin:$PATH"
 command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
 [ -d ".venv" ] || uv venv
 uv sync --extra gpu
 source .venv/bin/activate
