@@ -9,18 +9,21 @@ RUN_NAME="full_5m_may_2026"
 DATASET="jrast/clean-text-v1"
 GPU_COUNT=8
 
-GPU_ID="NVIDIA H100 SXM"
-IMAGE="runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404"
+GPU_ID="NVIDIA H100 80GB HBM3"
+CLOUD_TYPE="SECURE"
+DATA_CENTER_IDS=""
+TEMPLATE_ID=""
+IMAGE="runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"
 REPO_URL="https://github.com/jacobrast/nanochat.git"
 BRANCH="master"
 POD_NAME="nanochat-full-5m"
 CONTAINER_DISK_GB=200
 VOLUME_GB=500
-STOP_AFTER="8h"
+STOP_AFTER_HOURS=8
 DRY_RUN=0
 
 usage() {
-    echo "Usage: $0 [--run-name NAME] [--dataset OWNER/NAME|URL] [--gpu-count N] [--gpu-id GPU] [--branch BRANCH] [--dry-run]" >&2
+    echo "Usage: $0 [--run-name NAME] [--dataset OWNER/NAME|URL] [--gpu-count N] [--gpu-id GPU] [--template-id ID|--image IMAGE] [--cloud-type SECURE|COMMUNITY] [--data-center-ids IDS] [--container-disk-gb N] [--volume-gb N] [--branch BRANCH] [--stop-after-hours N] [--dry-run]" >&2
 }
 
 while [ $# -gt 0 ]; do
@@ -57,12 +60,72 @@ while [ $# -gt 0 ]; do
             GPU_ID="${1#*=}"
             shift
             ;;
+        --cloud-type)
+            CLOUD_TYPE="$2"
+            shift 2
+            ;;
+        --cloud-type=*)
+            CLOUD_TYPE="${1#*=}"
+            shift
+            ;;
+        --template-id)
+            TEMPLATE_ID="$2"
+            IMAGE=""
+            shift 2
+            ;;
+        --template-id=*)
+            TEMPLATE_ID="${1#*=}"
+            IMAGE=""
+            shift
+            ;;
+        --image)
+            IMAGE="$2"
+            TEMPLATE_ID=""
+            shift 2
+            ;;
+        --image=*)
+            IMAGE="${1#*=}"
+            TEMPLATE_ID=""
+            shift
+            ;;
+        --data-center-ids)
+            DATA_CENTER_IDS="$2"
+            shift 2
+            ;;
+        --data-center-ids=*)
+            DATA_CENTER_IDS="${1#*=}"
+            shift
+            ;;
+        --container-disk-gb)
+            CONTAINER_DISK_GB="$2"
+            shift 2
+            ;;
+        --container-disk-gb=*)
+            CONTAINER_DISK_GB="${1#*=}"
+            shift
+            ;;
+        --volume-gb)
+            VOLUME_GB="$2"
+            shift 2
+            ;;
+        --volume-gb=*)
+            VOLUME_GB="${1#*=}"
+            shift
+            ;;
         --branch)
             BRANCH="$2"
             shift 2
             ;;
         --branch=*)
             BRANCH="${1#*=}"
+            shift
+            ;;
+        --stop-after-hours)
+            STOP_AFTER_HOURS="$2"
+            shift 2
+            ;;
+        --stop-after-hours=*)
+            STOP_AFTER_HOURS="${1#*=}"
             shift
             ;;
         --dry-run)
@@ -96,6 +159,11 @@ if ! command -v base64 &> /dev/null; then
     exit 1
 fi
 
+if ! [[ "$STOP_AFTER_HOURS" =~ ^[0-9]+$ ]]; then
+    echo "STOP_AFTER_HOURS must be a positive integer" >&2
+    exit 1
+fi
+
 case "$DATASET" in
     http://*|https://*)
         DATASET_BASE_URL="${DATASET%/}"
@@ -109,6 +177,15 @@ case "$DATASET" in
 esac
 
 DATASET_DIR_NAME="$RUN_NAME"
+STOP_AFTER=$(python3 - "$STOP_AFTER_HOURS" <<'PY'
+from datetime import datetime, timedelta, timezone
+import sys
+
+hours = int(sys.argv[1])
+dt = datetime.now(timezone.utc) + timedelta(hours=hours)
+print(dt.isoformat(timespec="seconds").replace("+00:00", "Z"))
+PY
+)
 
 ENV_JSON=$(python3 - "$WANDB_API_KEY" "$RUN_NAME" "$DATASET_BASE_URL" "$DATASET_DIR_NAME" <<'PY'
 import json
@@ -144,16 +221,16 @@ quote() {
     printf "%q" "$1"
 }
 
-REMOTE_CMD="set -e; cd /workspace; if [ -d nanochat/.git ]; then cd nanochat; git fetch origin; git checkout $(quote "$BRANCH"); git pull --ff-only origin $(quote "$BRANCH"); else git clone --branch $(quote "$BRANCH") $(quote "$REPO_URL") nanochat; cd nanochat; fi; bash runs/speedrun_template.sh --no-tmux --gpus $(quote "$GPU_COUNT")"
+REMOTE_CMD="set -e; apt-get update; apt-get install -y git ca-certificates; cd /workspace; if [ -d nanochat/.git ]; then cd nanochat; git fetch origin; git checkout $(quote "$BRANCH"); git pull --ff-only origin $(quote "$BRANCH"); else git clone --branch $(quote "$BRANCH") $(quote "$REPO_URL") nanochat; cd nanochat; fi; bash runs/speedrun_template.sh --no-tmux --gpus $(quote "$GPU_COUNT")"
 REMOTE_CMD_B64=$(printf "%s" "$REMOTE_CMD" | base64 | tr -d '\n')
-DOCKER_ARGS="bash -lc 'echo $REMOTE_CMD_B64 | base64 -d | bash'"
+DOCKER_ARGS="bash -lc 'set -o pipefail; echo $REMOTE_CMD_B64 | base64 -d | bash 2>&1 | tee /workspace/startup.log; status=\${PIPESTATUS[0]}; if [ \$status -ne 0 ]; then echo startup failed with status \$status; tail -f /dev/null; fi; exit \$status'"
 
 CMD=(
     runpodctl pod create
     --name "$POD_NAME"
-    --image "$IMAGE"
     --gpu-id "$GPU_ID"
     --gpu-count "$GPU_COUNT"
+    --cloud-type "$CLOUD_TYPE"
     --container-disk-in-gb "$CONTAINER_DISK_GB"
     --volume-in-gb "$VOLUME_GB"
     --env "$ENV_JSON"
@@ -164,9 +241,9 @@ CMD=(
 DISPLAY_CMD=(
     runpodctl pod create
     --name "$POD_NAME"
-    --image "$IMAGE"
     --gpu-id "$GPU_ID"
     --gpu-count "$GPU_COUNT"
+    --cloud-type "$CLOUD_TYPE"
     --container-disk-in-gb "$CONTAINER_DISK_GB"
     --volume-in-gb "$VOLUME_GB"
     --env "$MASKED_ENV_JSON"
@@ -174,9 +251,32 @@ DISPLAY_CMD=(
     --stop-after "$STOP_AFTER"
 )
 
+if [ -n "$TEMPLATE_ID" ]; then
+    CMD+=(--template-id "$TEMPLATE_ID")
+    DISPLAY_CMD+=(--template-id "$TEMPLATE_ID")
+elif [ -n "$IMAGE" ]; then
+    CMD+=(--image "$IMAGE")
+    DISPLAY_CMD+=(--image "$IMAGE")
+else
+    echo "Set TEMPLATE_ID or IMAGE." >&2
+    exit 1
+fi
+
+if [ -n "$DATA_CENTER_IDS" ]; then
+    CMD+=(--data-center-ids "$DATA_CENTER_IDS")
+    DISPLAY_CMD+=(--data-center-ids "$DATA_CENTER_IDS")
+fi
+
 printf "Run name: %s\n" "$RUN_NAME"
 printf "Dataset URL: %s\n" "$DATASET_BASE_URL"
-printf "GPU count: %s\n" "$GPU_COUNT"
+printf "GPU: %sx %s\n" "$GPU_COUNT" "$GPU_ID"
+printf "Template: %s\n" "${TEMPLATE_ID:-none}"
+printf "Image: %s\n" "${IMAGE:-none}"
+printf "Cloud: %s\n" "$CLOUD_TYPE"
+printf "Data centers: %s\n" "${DATA_CENTER_IDS:-any}"
+printf "Container disk: %s GB\n" "$CONTAINER_DISK_GB"
+printf "Volume: %s GB\n" "$VOLUME_GB"
+printf "Stop after: %s\n" "$STOP_AFTER"
 printf "Remote command:\n%s\n" "$REMOTE_CMD"
 printf "Command:\n"
 printf "  %q" "${DISPLAY_CMD[@]}"
@@ -191,6 +291,5 @@ if ! command -v runpodctl &> /dev/null; then
     exit 1
 fi
 
-runpodctl config --apiKey "$RUNPOD_API_KEY"
-
+export RUNPOD_API_KEY
 "${CMD[@]}"
